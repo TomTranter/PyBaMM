@@ -703,8 +703,10 @@ def _piecewise_bilinear_2d(x0_data, x1_data, y_data_2d, arg0_str, arg1_str,
     return "(" + " + ".join(terms) + ")"
 
 
-# Threshold: tables larger than this use Chebyshev approximation
-_INTERP_CHEBYSHEV_THRESHOLD = 30
+# Threshold: tables larger than this use Chebyshev approximation.
+# Set high to prefer piecewise-linear (exact at data points, no polynomial ringing).
+# Chebyshev is only useful for very large tables where DiffSL code size matters.
+_INTERP_CHEBYSHEV_THRESHOLD = 10000
 
 
 def _interpolant_to_diffeq(equation, y_slice_to_label, symbol_to_tensor_name,
