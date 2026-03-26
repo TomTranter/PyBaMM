@@ -563,6 +563,188 @@ class DiffSLExport:
         return "\n".join(all_lines) + "\n"
 
 
+def _piecewise_linear_1d(x_data, y_data, arg_str, float_precision=20):
+    """Emit piecewise-linear interpolation as nested max/min expressions.
+
+    For x_data = [x0, x1, ..., xN] and y_data = [y0, y1, ..., yN],
+    produces an expression equivalent to np.interp(arg, x_data, y_data).
+
+    Strategy: clamp arg to [x0, xN], then for each interval [x_i, x_{i+1}]
+    compute the contribution using a "hat function" approach:
+
+        result = y0 + sum_i( slope_i * max(0, min(arg - x_i, dx_i)) )
+
+    This is equivalent to piecewise-linear interpolation and uses only
+    arithmetic + max/min which DiffSL supports natively.
+    """
+    n = len(x_data)
+    if n == 1:
+        return f"{y_data[0]:.{float_precision}g}"
+
+    # Clamp to domain
+    x_lo = f"{x_data[0]:.{float_precision}g}"
+    x_hi = f"{x_data[-1]:.{float_precision}g}"
+    clamped = f"max(min({arg_str}, {x_hi}), {x_lo})"
+
+    # Build cumulative ramp: y0 + sum of slope * clamp(x - x_i, 0, dx_i)
+    terms = [f"{y_data[0]:.{float_precision}g}"]
+    for i in range(n - 1):
+        dx = x_data[i + 1] - x_data[i]
+        dy = y_data[i + 1] - y_data[i]
+        if abs(dy) < 1e-30:
+            continue
+        slope = dy / dx
+        xi = f"{x_data[i]:.{float_precision}g}"
+        dxi = f"{dx:.{float_precision}g}"
+        # contribution = slope * max(0, min(clamped - x_i, dx_i))
+        terms.append(
+            f"({slope:.{float_precision}g} * max(min(({clamped} - {xi}), {dxi}), 0))"
+        )
+
+    return "(" + " + ".join(terms) + ")"
+
+
+def _chebyshev_approx_1d(x_data, y_data, arg_str, degree=15, float_precision=20):
+    """Fit Chebyshev polynomial to 1D data, emit as DiffSL arithmetic.
+
+    Maps the input domain [x_data[0], x_data[-1]] to [-1, 1] then
+    evaluates using the Chebyshev recurrence:
+        T_0 = 1, T_1 = u, T_{k+1} = 2*u*T_k - T_{k-1}
+    where u = 2*(arg - x_lo)/(x_hi - x_lo) - 1.
+
+    Output is a single arithmetic expression — no Interpolant needed.
+    """
+    from numpy.polynomial import chebyshev as C
+
+    # Fit in native Chebyshev domain [-1, 1]
+    x_lo, x_hi = float(x_data[0]), float(x_data[-1])
+    x_mapped = 2.0 * (x_data - x_lo) / (x_hi - x_lo) - 1.0
+    coeffs = C.chebfit(x_mapped, y_data, min(degree, len(x_data) - 1))
+
+    # Map arg to [-1, 1]
+    u = f"(2 * ({arg_str} - {x_lo:.{float_precision}g}) / {(x_hi - x_lo):.{float_precision}g} - 1)"
+
+    # Clenshaw evaluation: more numerically stable than naive sum
+    # But for DiffSL we need a flat expression. Use the recurrence inline.
+    n = len(coeffs)
+    if n == 1:
+        return f"{coeffs[0]:.{float_precision}g}"
+    if n == 2:
+        return f"({coeffs[0]:.{float_precision}g} + {coeffs[1]:.{float_precision}g} * {u})"
+
+    # Build T_k(u) expressions iteratively
+    # T0 = 1, T1 = u, T2 = 2*u*u - 1, etc.
+    # For large n this gets verbose but it's pure arithmetic
+    result_parts = [f"{coeffs[0]:.{float_precision}g}"]
+    result_parts.append(f"({coeffs[1]:.{float_precision}g} * {u})")
+
+    # For k >= 2, use: c_k * T_k(u) where T_k uses recurrence
+    # We'll expand T_k inline. For degree <= 15 this is manageable.
+    t_prev = "1"
+    t_curr = u
+    for k in range(2, n):
+        t_next = f"(2 * {u} * {t_curr} - {t_prev})"
+        if abs(coeffs[k]) > 1e-30:
+            result_parts.append(f"({coeffs[k]:.{float_precision}g} * {t_next})")
+        t_prev = t_curr
+        t_curr = t_next
+
+    return "(" + " + ".join(result_parts) + ")"
+
+
+def _piecewise_bilinear_2d(x0_data, x1_data, y_data_2d, arg0_str, arg1_str,
+                           float_precision=20):
+    """Emit 2D bilinear interpolation for small grids.
+
+    For each cell in the (x0, x1) grid, computes bilinear weight
+    using max/min clamping. Only practical for small grids (< 20×20).
+
+    y_data_2d has shape (len(x0_data), len(x1_data)).
+    """
+    n0 = len(x0_data)
+    n1 = len(x1_data)
+
+    if n0 == 1 and n1 == 1:
+        return f"{y_data_2d[0, 0]:.{float_precision}g}"
+
+    # If one dimension is singleton, reduce to 1D
+    if n1 == 1:
+        return _piecewise_linear_1d(x0_data, y_data_2d[:, 0], arg0_str, float_precision)
+    if n0 == 1:
+        return _piecewise_linear_1d(x1_data, y_data_2d[0, :], arg1_str, float_precision)
+
+    # Full 2D: interpolate along x1 at each x0 grid point, then along x0
+    # This is "successive 1D interpolation"
+    # First interpolate along x1 for each x0 row
+    row_exprs = []
+    for i in range(n0):
+        row_expr = _piecewise_linear_1d(
+            x1_data, y_data_2d[i, :], arg1_str, float_precision
+        )
+        row_exprs.append(row_expr)
+
+    # Now interpolate the row results along x0
+    # Build a virtual 1D interp where y values are the row expressions
+    # Using the same ramp approach but with expression-valued "y"
+    x0_lo = f"{x0_data[0]:.{float_precision}g}"
+    x0_hi = f"{x0_data[-1]:.{float_precision}g}"
+    clamped0 = f"max(min({arg0_str}, {x0_hi}), {x0_lo})"
+
+    terms = [row_exprs[0]]
+    for i in range(n0 - 1):
+        dx = x0_data[i + 1] - x0_data[i]
+        xi = f"{x0_data[i]:.{float_precision}g}"
+        dxi = f"{dx:.{float_precision}g}"
+        # weight = max(0, min(clamped0 - x_i, dx_i)) / dx_i
+        weight = f"(max(min(({clamped0} - {xi}), {dxi}), 0) / {dxi})"
+        # contribution = weight * (row_{i+1} - row_i)
+        terms.append(f"({weight} * ({row_exprs[i + 1]} - {row_exprs[i]}))")
+
+    return "(" + " + ".join(terms) + ")"
+
+
+# Threshold: tables larger than this use Chebyshev approximation
+_INTERP_CHEBYSHEV_THRESHOLD = 30
+
+
+def _interpolant_to_diffeq(equation, y_slice_to_label, symbol_to_tensor_name,
+                            float_precision=20, transpose=False):
+    """Convert a pybamm.Interpolant to DiffSL arithmetic expression."""
+    # Recurse into children to get argument expressions
+    args = [
+        _equation_to_diffeq(
+            child, y_slice_to_label, symbol_to_tensor_name,
+            float_precision=float_precision, transpose=transpose,
+        )
+        for child in equation.children
+    ]
+
+    dim = equation.dimension
+    x_data = equation.x  # list of 1D arrays
+    y_data = equation.y  # 1D array (dim=1) or 2D array (dim=2)
+
+    if dim == 1:
+        x = x_data[0]
+        y = np.asarray(y_data).ravel()
+        if len(x) <= _INTERP_CHEBYSHEV_THRESHOLD:
+            return _piecewise_linear_1d(x, y, args[0], float_precision)
+        else:
+            return _chebyshev_approx_1d(x, y, args[0],
+                                        degree=15, float_precision=float_precision)
+    elif dim == 2:
+        x0 = x_data[0]
+        x1 = x_data[1]
+        y_2d = np.asarray(y_data)
+        if y_2d.shape != (len(x0), len(x1)):
+            y_2d = y_2d.reshape(len(x0), len(x1))
+        return _piecewise_bilinear_2d(x0, x1, y_2d, args[0], args[1],
+                                      float_precision)
+    else:
+        raise NotImplementedError(
+            f"DiffSL export for {dim}D Interpolant not implemented"
+        )
+
+
 def _equation_to_diffeq(
     equation: pybamm.Symbol,
     y_slice_to_label: dict[tuple[int], str],
@@ -614,6 +796,13 @@ def _equation_to_diffeq(
         return f"({left} {equation.name} {right})"
     elif isinstance(equation, pybamm.UnaryOperator):
         return f"{equation.name}({_equation_to_diffeq(equation.child, y_slice_to_label, symbol_to_tensor_name, float_precision=float_precision, transpose=transpose)})"
+    elif isinstance(equation, pybamm.Interpolant):
+        # Interpolant is a Function subclass — handle before generic Function.
+        # Emit piecewise-linear (small tables) or Chebyshev polynomial (large).
+        return _interpolant_to_diffeq(
+            equation, y_slice_to_label, symbol_to_tensor_name,
+            float_precision=float_precision, transpose=transpose,
+        )
     elif isinstance(equation, pybamm.Function):
         name = equation.function.__name__
         args = [
