@@ -1180,10 +1180,12 @@ def _piecewise_linear_1d(x_data, y_data, arg_str, float_precision=20):
 def _chebyshev_approx_1d(x_data, y_data, arg_str, degree=15, float_precision=20):
     """Fit Chebyshev polynomial to 1D data, emit as DiffSL arithmetic.
 
-    Maps the input domain [x_data[0], x_data[-1]] to [-1, 1] then
-    evaluates using the Chebyshev recurrence:
-        T_0 = 1, T_1 = u, T_{k+1} = 2*u*T_k - T_{k-1}
-    where u = 2*(arg - x_lo)/(x_hi - x_lo) - 1.
+    Maps the input domain [x_data[0], x_data[-1]] to [-1, 1] then evaluates
+    via Horner's rule on the equivalent monomial polynomial. The emitted
+    code size is O(degree) — earlier versions of this routine built T_k(u)
+    by string-substituting the previous T_{k-1}, which doubled the literal
+    length per iteration and pushed degree-15 outputs above 150 KB per LUT
+    (blowing past Cranelift's i32 jump offsets on DFN-scale models).
 
     Output is a single arithmetic expression — no Interpolant needed.
     """
@@ -1192,37 +1194,31 @@ def _chebyshev_approx_1d(x_data, y_data, arg_str, degree=15, float_precision=20)
     # Fit in native Chebyshev domain [-1, 1]
     x_lo, x_hi = float(x_data[0]), float(x_data[-1])
     x_mapped = 2.0 * (x_data - x_lo) / (x_hi - x_lo) - 1.0
-    coeffs = C.chebfit(x_mapped, y_data, min(degree, len(x_data) - 1))
+    cheb_coeffs = C.chebfit(x_mapped, y_data, min(degree, len(x_data) - 1))
+
+    # Convert to monomial basis so we can Horner-evaluate without expanding
+    # T_k inline (which is exponential in degree).
+    mono = C.cheb2poly(cheb_coeffs)
+    # Trim trailing near-zero coefficients to keep the expression compact.
+    while len(mono) > 1 and abs(mono[-1]) < 1e-30:
+        mono = mono[:-1]
 
     # Map arg to [-1, 1]
     u = f"(2 * ({arg_str} - {x_lo:.{float_precision}g}) / {(x_hi - x_lo):.{float_precision}g} - 1)"
 
-    # Clenshaw evaluation: more numerically stable than naive sum
-    # But for DiffSL we need a flat expression. Use the recurrence inline.
-    n = len(coeffs)
+    n = len(mono)
     if n == 1:
-        return f"{coeffs[0]:.{float_precision}g}"
+        return f"{mono[0]:.{float_precision}g}"
     if n == 2:
-        return f"({coeffs[0]:.{float_precision}g} + {coeffs[1]:.{float_precision}g} * {u})"
+        return f"({mono[0]:.{float_precision}g} + {mono[1]:.{float_precision}g} * {u})"
 
-    # Build T_k(u) expressions iteratively
-    # T0 = 1, T1 = u, T2 = 2*u*u - 1, etc.
-    # For large n this gets verbose but it's pure arithmetic
-    result_parts = [f"{coeffs[0]:.{float_precision}g}"]
-    result_parts.append(f"({coeffs[1]:.{float_precision}g} * {u})")
-
-    # For k >= 2, use: c_k * T_k(u) where T_k uses recurrence
-    # We'll expand T_k inline. For degree <= 15 this is manageable.
-    t_prev = "1"
-    t_curr = u
-    for k in range(2, n):
-        t_next = f"(2 * {u} * {t_curr} - {t_prev})"
-        if abs(coeffs[k]) > 1e-30:
-            result_parts.append(f"({coeffs[k]:.{float_precision}g} * {t_next})")
-        t_prev = t_curr
-        t_curr = t_next
-
-    return "(" + " + ".join(result_parts) + ")"
+    # Horner's rule on monomial coefficients:
+    #   p(u) = c0 + u*(c1 + u*(c2 + ... + u*c_{n-1}))
+    # Emits one `u` literal per coefficient — O(n) length, O(n) FLOPs.
+    expr = f"{mono[-1]:.{float_precision}g}"
+    for i in range(n - 2, -1, -1):
+        expr = f"({mono[i]:.{float_precision}g} + {u} * {expr})"
+    return expr
 
 
 def _piecewise_bilinear_2d(x0_data, x1_data, y_data_2d, arg0_str, arg1_str,
@@ -1277,9 +1273,16 @@ def _piecewise_bilinear_2d(x0_data, x1_data, y_data_2d, arg0_str, arg1_str,
 
 
 # Threshold: tables larger than this use Chebyshev approximation.
-# Set high to prefer piecewise-linear (exact at data points, no polynomial ringing).
-# Chebyshev is only useful for very large tables where DiffSL code size matters.
-_INTERP_CHEBYSHEV_THRESHOLD = 10000
+# Piecewise-linear is exact at data points but inlines O(N) max/min ops, which
+# bloats the DiffSL source enough on DFN-scale models to overflow Cranelift's
+# i32 jump offsets. Chebyshev keeps each LUT eval at fixed O(degree) code at
+# the cost of ~5 mV ringing on sharp OCV features. Override via env var
+# PYBAMM_DIFFSL_CHEBYSHEV_THRESHOLD if you want strict piecewise-linear.
+import os as _os
+
+_INTERP_CHEBYSHEV_THRESHOLD = int(
+    _os.environ.get("PYBAMM_DIFFSL_CHEBYSHEV_THRESHOLD", "30")
+)
 
 
 def _interpolant_to_diffeq(equation, y_slice_to_label, symbol_to_tensor_name,
