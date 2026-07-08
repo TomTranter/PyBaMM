@@ -634,3 +634,65 @@ class TestDiffSLExport:
         pos0 = export.index(s0)
         pos1 = export.index(s1)
         assert pos0 < pos1
+
+    def _interpolant_ode(self, x_data, f_data, name):
+        # Minimal ODE whose RHS is an Interpolant of the state variable:
+        #   dy/dt = -interp(y),  y(0) = 0.5
+        model = pybamm.BaseModel()
+        y = pybamm.Variable("y")
+        interp = pybamm.Interpolant(x_data, f_data, y, name=name)
+        model.rhs = {y: -interp}
+        model.initial_conditions = {y: pybamm.Scalar(0.5)}
+        model.variables = {"y": y, name: interp}
+        pybamm.Discretisation().process_model(model)
+        return model
+
+    def test_interpolant_small_table_piecewise_linear(self):
+        # A table at or below the piecewise-linear threshold is emitted as
+        # max/min arithmetic over the breakpoints — no Chebyshev, no
+        # Interpolant node left in the DiffSL source.
+        # Piecewise-linear form is base value + a clamped ramp term per
+        # segment, so the number of clamps grows with the breakpoint count
+        # and no Interpolant node survives. Compare two table sizes to pin
+        # the "one contribution per segment" behaviour without coupling to
+        # the exact clamp-nesting factor.
+        def clamp_count(n):
+            x = np.linspace(0.0, 1.0, n)
+            model = self._interpolant_ode(x, 2.0 * x + 1.0, f"ramp{n}")
+            export = pybamm.DiffSLExport(model).to_diffeq(outputs=["y"])
+            assert "interpolant" not in export.lower()
+            assert "max(min(" in export  # piecewise, not Chebyshev
+            return export.count("max(min(")
+
+        assert clamp_count(12) > clamp_count(6) > clamp_count(4)
+
+    def test_interpolant_large_table_chebyshev(self):
+        # A table above the piecewise-linear threshold falls back to a
+        # Chebyshev polynomial approximation; it must still export to a
+        # single arithmetic expression with no Interpolant node remaining.
+        x_data = np.linspace(0.0, 1.0, 60)
+        f_data = np.sin(6.0 * x_data) + 2.0
+        model = self._interpolant_ode(x_data, f_data, "wave")
+        export = pybamm.DiffSLExport(model).to_diffeq(outputs=["y"])
+
+        assert "interpolant" not in export.lower()
+        # Chebyshev is Horner-evaluated: output size is O(degree), so the
+        # source stays small even though the table has 60 points.
+        assert len(export) < 20_000
+
+    def test_interpolant_2d_bilinear(self):
+        # 2D Interpolant exports via successive 1D interpolation (bilinear).
+        x1 = np.linspace(0.0, 1.0, 5)
+        x2 = np.linspace(0.0, 1.0, 5)
+        f = np.add.outer(x1, 2.0 * x2)  # shape (5, 5)
+        model = pybamm.BaseModel()
+        a = pybamm.Variable("a")
+        b = pybamm.Variable("b")
+        interp = pybamm.Interpolant([x1, x2], f, (a, b), name="grid")
+        model.rhs = {a: -interp, b: pybamm.Scalar(0.0)}
+        model.initial_conditions = {a: pybamm.Scalar(0.5), b: pybamm.Scalar(0.5)}
+        model.variables = {"a": a, "b": b}
+        pybamm.Discretisation().process_model(model)
+        export = pybamm.DiffSLExport(model).to_diffeq(outputs=["a"])
+
+        assert "interpolant" not in export.lower()
