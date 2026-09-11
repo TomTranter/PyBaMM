@@ -578,6 +578,73 @@ class DiffSLExport:
         is_event: bool = False,
         num_terminal_states: int = 0,
     ) -> int:
+        # Tensors that cannot be inlined, hoisted bottom-up.
+        #
+        # Two constructs have to become tensors of their own before anything
+        # stringifies an expression containing them:
+        #
+        #   * `DomainConcatenation`, because `equation_to_diffeq` has no case
+        #     for it — it can only emit the name of a tensor already hoisted,
+        #     and raises `TypeError: DomainConcatenation not implemented`
+        #     otherwise.
+        #   * `A @ x` with a matrix `A`, because it is emitted with a
+        #     contraction index (`constant7_ij * y_j`), which is only
+        #     meaningful in a tensor of its own. Inlined into a concatenation
+        #     slice the contraction binds to the slice's index instead, and the
+        #     model compiles and evaluates to the wrong numbers.
+        #
+        # They nest both ways round: a concatenation's children contain matrix
+        # products, and matrix products contain concatenations. So neither can
+        # be given its own pass ahead of the other — `post_order` is what makes
+        # this work, visiting descendants before the expressions that contain
+        # them, so whichever is inner is already a tensor by the time the outer
+        # one is written out.
+        #
+        # Skips the top-level symbol: a construct that *is* the equation needs
+        # no tensor of its own.
+        for child in eqn.children:
+            for symbol in child.post_order():
+                if symbol in symbol_to_tensor_name:
+                    continue
+                is_matmul = (
+                    isinstance(symbol, pybamm.BinaryOperator)
+                    and symbol.name == "@"
+                    and isinstance(symbol.left, pybamm.Matrix)
+                )
+                if is_matmul:
+                    tensor_index = self._materialize_expression_tensor(
+                        symbol,
+                        symbol_to_tensor_name,
+                        tensor_index,
+                        y_slice_to_label,
+                        diffeq,
+                        is_variable=is_variable,
+                        is_event=is_event,
+                    )
+                elif isinstance(symbol, pybamm.DomainConcatenation):
+                    new_line = "\n"
+                    tensor_name = DiffSLExport._name_tensor(
+                        symbol, tensor_index, is_variable, is_event
+                    )
+                    tensor_index += 1
+                    lines = [f"{tensor_name}_i " + "{"]
+                    for conc_child, slices in zip(
+                        symbol.children, symbol._children_slices, strict=False
+                    ):
+                        eqn_str = equation_to_diffeq(
+                            conc_child,
+                            y_slice_to_label,
+                            symbol_to_tensor_name,
+                            float_precision=self.float_precision,
+                            use_model_index=self._has_experiment,
+                        )
+                        for child_dom, child_slice in slices.items():
+                            for i, _slice in enumerate(child_slice):
+                                sl = symbol._slices[child_dom][i]
+                                lines += [f"  ({sl.start}:{sl.stop}): {eqn_str},"]
+                    symbol_to_tensor_name[symbol] = tensor_name
+                    diffeq[tensor_name] = new_line.join(lines) + new_line + "}"
+
         for symbol in eqn.post_order():
             if isinstance(symbol, pybamm.Conditional):
                 tensor_index = self._materialize_conditional_tensor(
@@ -632,31 +699,6 @@ class DiffSLExport:
                         is_event=is_event,
                     )
 
-                elif isinstance(symbol, pybamm.DomainConcatenation):
-                    if symbol in symbol_to_tensor_name:
-                        continue
-                    new_line = "\n"
-                    tensor_name = DiffSLExport._name_tensor(
-                        symbol, tensor_index, is_variable, is_event
-                    )
-                    tensor_index += 1
-                    lines = [f"{tensor_name}_i " + "{"]
-                    for child, slices in zip(
-                        symbol.children, symbol._children_slices, strict=False
-                    ):
-                        eqn_str = equation_to_diffeq(
-                            child,
-                            y_slice_to_label,
-                            symbol_to_tensor_name,
-                            float_precision=self.float_precision,
-                            use_model_index=self._has_experiment,
-                        )
-                        for child_dom, child_slice in slices.items():
-                            for i, _slice in enumerate(child_slice):
-                                s = symbol._slices[child_dom][i]
-                                lines += [f"  ({s.start}:{s.stop}): {eqn_str},"]
-                    symbol_to_tensor_name[symbol] = tensor_name
-                    diffeq[tensor_name] = new_line.join(lines) + new_line + "}"
 
         return tensor_index
 
